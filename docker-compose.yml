@@ -1,0 +1,52 @@
+# The local stack.
+#
+# EVERY published port is a `${*_HOST_PORT:-<conventional default>}` variable, never
+# a literal. That is what lets a parallel `git worktree` bring up a second stack
+# without editing this file: it sets the offsets in its own `.env`. A hardcoded port
+# here is the bug that makes two checkouts un-runnable at the same time — the
+# defaults exist so a bare clone with no `.env` still works.
+#
+# Containers, network, and volumes are namespaced by COMPOSE_PROJECT_NAME (set in
+# `.env`, and it must equal the checkout's directory name).
+
+services:
+  db:
+    image: postgres:18
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-apt_finder}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-apt_finder_local_dev}
+      POSTGRES_DB: ${POSTGRES_DB:-apt_finder}
+    ports:
+      - "${DB_HOST_PORT:-5438}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # Other services wait on this, so `up -d` returning means the DB is actually
+      # accepting connections — not merely that the container started.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-apt_finder}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    mem_limit: 512m
+
+  app:
+    build:
+      context: .
+      target: dev
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "${APP_HOST_PORT:-8006}:8000"
+    volumes:
+      # Bind-mounted for live reload. The venv stays in an anonymous volume so the
+      # host's (Windows) .venv never shadows the container's (Linux) one.
+      - .:/app
+      - /app/.venv
+    depends_on:
+      db:
+        condition: service_healthy
+    mem_limit: 1g
+
+volumes:
+  pgdata:
