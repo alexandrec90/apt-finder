@@ -4,13 +4,32 @@ version = "0.1.0"
 description = "Scrapes facebook and kijiji for apartment listings"
 requires-python = ">=3.12"
 dependencies = [
+  # Sibling checkout, editable (see [tool.uv.sources]). We use its database seam only:
+  # the declarative Base our tables hang off, the Connector contract, and
+  # `data_lake.configure(session_factory=...)`. Its provider credentials Protocol is
+  # deliberately not implemented here — see apt_finder/config.py.
+  "data-lake",
   "sqlalchemy>=2.0",
   "psycopg[binary]>=3.2",
   "alembic>=1.13",
   "pydantic-settings>=2.4",
+  "httpx>=0.27",
 ]
 
+[project.scripts]
+apt-finder = "apt_finder.cli:main"
+
+[tool.uv.sources]
+data-lake = { path = "../data-lake", editable = true }
+
 [project.optional-dependencies]
+# Facebook Marketplace only. Playwright plus a Chromium build is ~400 MB, and the
+# Kijiji path never touches it, so it stays out of a default `uv sync`. Modules that
+# need it guard the import and raise an install hint — importing apt_finder.scrapers
+# .facebook without it must still work, which is what keeps the test suite browserless.
+facebook = [
+  "playwright>=1.47",
+]
 # Host-only toolchain. Deliberately NOT installed into the container image — it is
 # several hundred MB of tooling the runtime never imports.
 dev = [
@@ -50,4 +69,18 @@ exclude = '^scripts/(hooks/|sync-harness\.py)'
 # Optional at runtime: `notify.py` guards the import and no-ops without it, so the
 # toast dependency is deliberately not installed.
 module = ["win11toast"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# The sibling data-lake package ships no `py.typed` marker, so mypy refuses to read its
+# annotations even though they exist. Nothing to fix on this side; the fix belongs
+# upstream (add `py.typed` to that package) and this override goes away when it lands.
+module = ["data_lake.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# Optional extra. `scrapers/facebook.py` guards this import and raises an install hint,
+# so the package must type-check with no browser installed — which is also how CI and
+# the Kijiji-only path run.
+module = ["playwright.*"]
 ignore_missing_imports = true

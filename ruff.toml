@@ -8,6 +8,10 @@ force-exclude = true
 select = ["E", "F", "I", "UP", "B", "ASYNC", "S", "SIM", "T20", "N", "RUF"]
 
 [lint.per-file-ignores]
+# The CLI's entire interface is its stdout, so T201 (print) has nothing to say here.
+# Same rationale as the `scripts/**` entry below; scoped to the one module that is a
+# terminal program, so a stray print anywhere else in the package still fails.
+"apt_finder/cli.py" = ["T201"]
 # CLI / diagnostic tooling: terminal output (T201), terse loop vars (E741), and long
 # regex/format lines (E501) are idiomatic here. These scripts orchestrate trusted
 # first-party tools (git, ruff, docker) via subprocess, so the bandit
