@@ -6,6 +6,20 @@ force-exclude = true
 
 [lint]
 select = ["E", "F", "I", "UP", "B", "ASYNC", "S", "SIM", "T20", "N", "RUF"]
+# E501 off everywhere, per `.claude/rules/engineering.md`: lint is for correctness and
+# security, and "anything a formatter can decide" is off. `line-length` above still
+# drives `ruff format`, so code is wrapped at 100 on every edit — the difference is that
+# it happens silently instead of failing a commit.
+#
+# The rest of `E` stays on. E501 is the only cosmetic rule in it; E711/E722 and friends
+# are real correctness checks.
+#
+# It was already ignored for `scripts/`, `tests/` and the skill payloads below, which is
+# most of the tree — the residue was app code, where it fires on exactly the lines a
+# formatter cannot split: long string literals and URLs. Enforcing there bought nothing
+# and cost a blocked commit (a DSN that had to carry a `detect-secrets` pragma on the
+# same line could not satisfy both the 100-column limit and the scanner).
+ignore = ["E501"]
 
 [lint.per-file-ignores]
 # The CLI's entire interface is its stdout, so T201 (print) has nothing to say here.

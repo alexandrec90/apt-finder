@@ -45,15 +45,7 @@ class Settings(BaseSettings):
     # `docker-compose.yml` and to `DATABASE_URL` in `.env.example`. It reaches loopback
     # only, and any real deployment overrides it from `.env` — so it is a placeholder in
     # the same sense `.env.example` is, and that file is excluded from the scan outright.
-    #
-    # Written as two joined literals because the whole DSN plus the pragma is 132
-    # characters and the limit is 100 — there is no single-line spelling that satisfies
-    # both E501 and the scanner. The pragma stays on the credential half regardless, so
-    # this reads as a declared false positive rather than as an accident of wrapping.
-    database_url: str = (
-        "postgresql+psycopg://apt_finder:apt_finder_local_dev"  # pragma: allowlist secret
-        "@127.0.0.1:5438/apt_finder"
-    )
+    database_url: str = "postgresql+psycopg://apt_finder:apt_finder_local_dev@127.0.0.1:5438/apt_finder"  # pragma: allowlist secret
 
     # ------------------------------------------------------------------
     # Search criteria
