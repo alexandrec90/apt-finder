@@ -214,6 +214,10 @@ This project's own, one line each:
   session, which is functionally a password.
 - **Never relax the province rule to "QC or unknown" by default.** Ontario is 5 km away;
   `ALLOW_UNKNOWN_PROVINCE` exists so that choice is explicit and visible in the reasons.
+- **Never start an unattended watch loop that wasn't asked for.** Subscribing to a PR
+  or arming a recurring check spends a turn every time it fires, on a user who isn't
+  looking. `enforce-watch-budget.py` caps it; the reasoning is in
+  `.claude/rules/engineering.md` ("waiting is not polling").
 - **Scraping is subject to both sites' terms of service.** This is built for one
   person's own apartment search, on their own accounts, at human rates. Do not add
   concurrency, proxy rotation, CAPTCHA solving, or user-agent cycling — those change
