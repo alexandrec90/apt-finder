@@ -67,13 +67,39 @@ def test_a_missing_token_fails_the_job_naming_the_secret_to_add():
     assert "exit 1" in body, "the clone failure does not fail the step"
 
 
+def test_the_clone_failure_says_which_of_the_two_remedies_applies():
+    # GitHub answers "Repository not found" for a private repository the token cannot
+    # see, and the same for one that does not exist — so a bare clone failure cannot
+    # distinguish "no secret is set, and the job fell back to GITHUB_TOKEN" from "the
+    # secret is set but its token has no read access to data-lake". Those are different
+    # fixes, and a message that names both leaves the reader to guess: PR #4 burned a
+    # full CI round on exactly that ambiguity.
+    body = ACTION.read_text(encoding="utf-8")
+    assert 'if [ "${DATA_LAKE_TOKEN_SUPPLIED}" = "true" ]' in body, (
+        "the clone failure no longer branches on whether the secret reached the job"
+    )
+    error_lines = [line for line in body.splitlines() if "::error::" in line]
+    assert len(error_lines) >= 2, (
+        f"one message cannot cover both remedies; found {len(error_lines)}"
+    )
+
+
 def test_the_token_never_reaches_the_shell_through_an_expression():
     # `${{ }}` is substituted before bash parses the line, so a token interpolated
     # into `run:` becomes part of the program rather than a value. It must arrive
     # through `env:` instead.
+    #
+    # Two env vars are derived from the input. DATA_LAKE_TOKEN carries the value;
+    # DATA_LAKE_TOKEN_SUPPLIED carries only whether it is empty, which is what lets the
+    # script tell the two remedies above apart. The emptiness test has to stay a
+    # comparison — an expression that yields the token itself would put a secret in a
+    # variable nothing masks.
     for line in ACTION.read_text(encoding="utf-8").splitlines():
         if "${{" in line and "data-lake-token" in line:
-            assert line.strip().startswith("DATA_LAKE_TOKEN:"), line
+            name, _, expression = line.strip().partition(":")
+            assert name in {"DATA_LAKE_TOKEN", "DATA_LAKE_TOKEN_SUPPLIED"}, line
+            if name == "DATA_LAKE_TOKEN_SUPPLIED":
+                assert "!= ''" in expression, line
 
 
 def test_every_job_that_sets_up_the_environment_passes_the_token():
