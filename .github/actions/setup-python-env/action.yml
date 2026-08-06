@@ -1,9 +1,9 @@
 name: Set up the Python toolchain
 description: >-
-  Install Python and uv, then sync the project from its committed uv.lock. The
-  repository must already be checked out — a local composite action is loaded from
-  the workspace — so callers keep their own actions/checkout step, whose arguments
-  (ref, fetch-depth) differ per job.
+  Check out the sibling data-lake package, install Python and uv, then sync the
+  project from its committed uv.lock. The repository must already be checked out — a
+  local composite action is loaded from the workspace — so callers keep their own
+  actions/checkout step, whose arguments (ref, fetch-depth) differ per job.
 
 inputs:
   python-version:
@@ -12,10 +12,53 @@ inputs:
       has one place to change it rather than one per job.
     required: false
     default: "3.12"
+  data-lake-token:
+    description: >-
+      Token with read access to the sibling data-lake repository. That repo is
+      private, and the default GITHUB_TOKEN is scoped to this repository alone, so
+      without this the checkout below cannot see it. Empty falls back to
+      GITHUB_TOKEN, which is the correct behaviour if data-lake is ever made public.
+      Callers must pass it explicitly — composite actions cannot read `secrets`.
+    required: false
+    default: ""
 
 runs:
   using: composite
   steps:
+    - name: Check out the sibling data-lake package
+      # `[tool.uv.sources]` declares data-lake as an editable path dependency at
+      # `../data-lake`, so `uv sync` below cannot resolve until that directory
+      # exists. On a runner `../` is the work directory that contains the checkout —
+      # writable, but OUTSIDE $GITHUB_WORKSPACE, which is why this is a git clone and
+      # not actions/checkout (that action refuses a path above the workspace).
+      #
+      # Deliberately the default branch, not a pinned ref, unlike the devkit checkout
+      # in pr-gate.yml. An editable path dependency records no revision in uv.lock —
+      # locally it is whatever the developer has checked out — so pinning here would
+      # gate against a lake the author never ran. The cost is real and accepted: a
+      # bad push to data-lake reddens this repo's gate.
+      shell: bash
+      env:
+        DATA_LAKE_SLUG: alexandrec90/data-lake
+        # Never interpolated into the script body: an `${{ }}` expression there is
+        # substituted before bash sees it, which makes the value part of the program.
+        DATA_LAKE_TOKEN: ${{ inputs.data-lake-token || github.token }}
+        TARGET_DIR: ${{ github.workspace }}/../data-lake
+      run: |
+        set -euo pipefail
+        if [ -d "${TARGET_DIR}/.git" ]; then
+          echo "data-lake already present at ${TARGET_DIR}"
+          exit 0
+        fi
+        # Basic auth in an `-c` override rather than in the clone URL: `-c` applies to
+        # this invocation only, so the token is never written into the clone's
+        # .git/config where a later `git remote -v` would print it.
+        auth="$(printf 'x-access-token:%s' "${DATA_LAKE_TOKEN}" | base64 -w0)"
+        if ! git -c "http.extraheader=AUTHORIZATION: basic ${auth}" \
+             clone --depth 1 "https://github.com/${DATA_LAKE_SLUG}.git" "${TARGET_DIR}"; then
+          echo "::error::Could not clone ${DATA_LAKE_SLUG} — the editable path dependency in pyproject.toml cannot resolve without it. That repository is private, so the default GITHUB_TOKEN cannot read it: add a DATA_LAKE_TOKEN repository secret holding a token with read access to it, or make the repository public."
+          exit 1
+        fi
     - uses: actions/setup-python@v7
       with:
         python-version: ${{ inputs.python-version }}
