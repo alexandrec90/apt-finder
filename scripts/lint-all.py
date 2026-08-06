@@ -140,7 +140,19 @@ def run_tool(name: str, cmd: list[str], fix_hint: str) -> str:
         print(f"  {name}: not installed — skipped")
         return ""
     try:
-        result = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True)
+        # encoding/errors are explicit because `text=True` alone decodes with the
+        # locale default — cp1252 on a Windows host. Any linter that echoes a source
+        # line containing an accent (this codebase parses French listings, so most of
+        # them do) then dies with a UnicodeDecodeError inside subprocess's reader
+        # thread, leaving `stdout` as None and crashing this script on the next line.
+        result = subprocess.run(
+            cmd,
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
     except FileNotFoundError:
         print(f"  {name}: not installed — skipped")
         return ""
