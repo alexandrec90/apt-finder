@@ -37,9 +37,12 @@ jobs:
     # different failure mode and cache from the lint job.
     steps:
       - uses: actions/checkout@v7
-      - uses: ./.github/actions/setup-python-env
+      - uses: ./.github/actions/checkout-data-lake
         with:
           data-lake-token: ${{ secrets.DATA_LAKE_TOKEN }}
+      - uses: ./.github/actions/setup-python-env
+        with:
+          python-version: "3.12"
       - name: Run every hook over the whole repo
         # `--all-files` rather than the staged diff: on a push there is no staged diff.
         # NB this includes devkit's `devkit-drift` hook, which byte-compares the vendored
@@ -54,9 +57,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: ./.github/actions/setup-python-env
+      - uses: ./.github/actions/checkout-data-lake
         with:
           data-lake-token: ${{ secrets.DATA_LAKE_TOKEN }}
+      - uses: ./.github/actions/setup-python-env
+        with:
+          python-version: "3.12"
       - name: Install actionlint and dotenv-linter
         # Fail loudly, no `|| true`: `lint-all.py` degrades a missing linter to a
         # terminal note by design, so a silently skipped install here would leave the
@@ -108,9 +114,12 @@ jobs:
       DATABASE_URL: postgresql+psycopg://apt_finder:apt_finder_local_dev@127.0.0.1:5432/apt_finder # pragma: allowlist secret
     steps:
       - uses: actions/checkout@v7
-      - uses: ./.github/actions/setup-python-env
+      - uses: ./.github/actions/checkout-data-lake
         with:
           data-lake-token: ${{ secrets.DATA_LAKE_TOKEN }}
+      - uses: ./.github/actions/setup-python-env
+        with:
+          python-version: "3.12"
       - name: Apply migrations
         run: uv run python -m alembic upgrade head
       - name: Application suite
@@ -140,7 +149,7 @@ jobs:
           repository: alexandrec90/devkit
           # Pin a tag, never @main — one bad devkit commit must not redden every
           # consuming repo at once.
-          ref: v0.6.0
+          ref: v0.7.0
           path: .devkit-src
       # Deliberately NOT `./.github/actions/setup-python-env`: that action syncs the
       # project, and this job has nothing to sync for. `sync-devkit.py` is stdlib-only
