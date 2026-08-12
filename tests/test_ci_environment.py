@@ -17,6 +17,14 @@ byte-identical from the shared repo; a vendored file cannot carry one project's 
 sibling, and the pull that adopted v0.7.0 silently deleted the step. These tests are
 what caught that, and retargeting them is what keeps them able to catch it again.
 
+v0.8.0 then un-vendored `setup-python-env/action.yml` — how a project installs is the
+part that varies — and `--pull` deleted the file rather than handing back a
+project-owned copy, because `templates/` is a one-shot render that never reaches an
+existing project. Every job then failed on a missing `action.yml` before running a
+check. So the tests below assert that a workflow's local composite actions *exist*,
+not only that they are called in the right order: a `uses:` naming a directory with no
+`action.yml` fails the whole job, and nothing else here would have noticed.
+
 Ordering is now a property of the workflow rather than of one action's step list, so
 `test_the_clone_runs_before_the_python_setup` reads pr-gate.yml.
 
@@ -42,11 +50,81 @@ SETUP_ACTION_REF = "./.github/actions/setup-python-env"
 INSTALLING_WORKFLOWS = (PR_GATE, NIGHTLY)
 
 
+LOCAL_ACTION = re.compile(r"uses:\s*\./(\.github/actions/[\w./-]+)")
+
+
 def sibling_source_path() -> str:
     """The editable path `uv sync` will look for, straight from pyproject."""
     with (REPO_ROOT / "pyproject.toml").open("rb") as handle:
         pyproject = tomllib.load(handle)
     return pyproject["tool"]["uv"]["sources"]["data-lake"]["path"]
+
+
+def local_actions_used(workflow: Path) -> list[str]:
+    """Repo-relative paths of the local composite actions a workflow calls.
+
+    Comment lines are dropped first: pr-gate.yml's devkit-drift job explains in prose
+    why it deliberately does *not* use `./.github/actions/setup-python-env`, and a scan
+    that read comments would count that paragraph as a call site.
+    """
+    lines = [
+        line
+        for line in workflow.read_text(encoding="utf-8").splitlines()
+        if not line.lstrip().startswith("#")
+    ]
+    return LOCAL_ACTION.findall("\n".join(lines))
+
+
+def test_every_local_composite_action_a_workflow_calls_exists():
+    # `uses: ./path` with no action.yml under it is not a skipped step: the runner fails
+    # the job with "Can't find 'action.yml' ... Did you forget to run actions/checkout",
+    # before any check runs. It is how PR #9 reddened three jobs at once — devkit
+    # v0.8.0 un-vendored `setup-python-env/action.yml`, `--pull` deleted this project's
+    # copy, and the four `uses:` directives naming it were left pointing at nothing.
+    # Nothing else in this suite reads a workflow's `uses:` for existence, and the
+    # vendored CI contract test asserts which *workflows* exist, not which actions
+    # resolve.
+    seen = 0
+    for workflow in sorted((REPO_ROOT / ".github" / "workflows").glob("*.yml")):
+        for used in local_actions_used(workflow):
+            seen += 1
+            action = REPO_ROOT / used
+            assert (action / "action.yml").is_file() or (action / "action.yaml").is_file(), (
+                f"{workflow.name} calls ./{used}, which has no action.yml. Every job "
+                "using it fails before running a check. If a devkit `--pull` deleted "
+                "it, restore it from devkit's "
+                f"templates/core/dot-github/actions/{Path(used).name}/action.yml -- it "
+                "is the project's own file, not a vendored one, so nothing upstream "
+                "will put it back."
+            )
+    assert seen, "no workflow calls a local composite action -- the scan is inert"
+
+
+def test_the_setup_action_is_still_the_one_the_workflows_call():
+    # Pins the pair the test above can only check together: the file exists AND it is
+    # what the gate names. Restoring the action under a different directory name, or
+    # switching the workflows to inline setup steps, would leave that test passing
+    # vacuously for this project's most-used action.
+    assert (REPO_ROOT / SETUP_ACTION_REF.removeprefix("./") / "action.yml").is_file()
+    assert SETUP_ACTION_REF.removeprefix("./") in local_actions_used(PR_GATE)
+
+
+def test_the_local_action_scan_ignores_prose_and_reads_real_directives():
+    body = "\n".join(
+        (
+            "      # Deliberately NOT `./.github/actions/setup-python-env`: prose.",
+            "      - uses: ./.github/actions/checkout-data-lake",
+            "      - uses: actions/checkout@v7",
+            "      - uses: ./.github/actions/setup-python-env",
+        )
+    )
+    assert LOCAL_ACTION.findall(body) == [
+        ".github/actions/checkout-data-lake",
+        ".github/actions/setup-python-env",
+    ]
+    assert LOCAL_ACTION.findall("# - uses: ./.github/actions/gone") == [".github/actions/gone"], (
+        "the regex itself is comment-blind; local_actions_used is what filters"
+    )
 
 
 def test_the_gate_clones_exactly_the_path_uv_will_look_for():
@@ -144,12 +222,12 @@ def test_every_job_that_clones_the_sibling_passes_the_token():
             )
 
 
-def test_the_vendored_setup_action_is_never_given_project_specific_inputs():
-    # The regression that produced this split. `setup-python-env/action.yml` is in
-    # devkit's MANIFEST and byte-compared by the `devkit-drift` gate, so it can only
-    # ever accept the inputs devkit declares. A call site passing `data-lake-token`
-    # here would be re-creating the deleted step's interface against an action that no
-    # longer has it: silently ignored, and the clone never happens.
+def test_the_setup_action_is_never_given_project_specific_inputs():
+    # The regression that produced this split. `setup-python-env/action.yml` declares
+    # one input, `python-version`, and a composite action ignores an input it does not
+    # declare. A call site passing `data-lake-token` here would be re-creating the
+    # deleted step's interface against an action that no longer has it: silently
+    # ignored, and the clone never happens.
     for workflow in INSTALLING_WORKFLOWS:
         lines = workflow.read_text(encoding="utf-8").splitlines()
         for index, line in enumerate(lines):

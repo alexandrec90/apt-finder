@@ -1,0 +1,62 @@
+# This file is the project's own. It arrives once from devkit's `templates/` and is
+# never vendored — `sync-devkit.py --check` does not compare it — so editing it is the
+# supported way to change how this project installs. devkit tried vendoring it in
+# v0.7.0 and two consumers broke on the first pull that reached them; see `MANIFEST` in
+# `scripts/sync-devkit.py` for that history, and the sync step below for what it means
+# in practice.
+#
+# This copy was deleted outright by the `--pull` that adopted v0.8.0 — unvendoring a
+# file removes it, and `templates/` is a one-shot copy that never re-renders into an
+# existing project — so every job in PR #9 died on "Can't find 'action.yml' ... under
+# .github/actions/setup-python-env" before running a check. Restored here as the
+# project's own; `tests/test_ci_environment.py` now asserts that every local composite
+# action a workflow names actually exists, which is the check that was missing.
+name: Set up the Python toolchain
+description: >-
+  Install Python and uv, then sync the project from its committed uv.lock. The
+  repository must already be checked out — a local composite action is loaded from
+  the workspace — so callers keep their own actions/checkout step, whose arguments
+  (ref, fetch-depth) differ per job.
+
+  This project's sibling `data-lake` clone is NOT here: it is its own action,
+  `checkout-data-lake`, which every caller runs first. Keeping it separate is what
+  survived the v0.7.0/v0.8.0 vendoring churn intact.
+
+inputs:
+  python-version:
+    description: >-
+      Python version to install. The default is a floor, not this project's version —
+      devkit's `templates/` copy is copied verbatim rather than rendered (it is held
+      byte-identical to devkit's own by `test_setup_action_template_matches_devkits`),
+      so no project's `python_version` is ever substituted into it. A generated
+      project's gate passes its own version explicitly at every call site for exactly
+      that reason; a project that moves off 3.12 and relies on the default here would
+      provision the wrong interpreter without failing.
+    required: false
+    default: "3.12"
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v7
+      with:
+        python-version: ${{ inputs.python-version }}
+    - name: Install uv
+      shell: bash
+      run: pip install uv
+    - name: Sync the project from uv.lock
+      # The same command `.claude/hooks/session-start.sh` runs, against the same
+      # committed lock — so a job provisions the way a session does, and a lock that
+      # cannot resolve fails here rather than in someone's sandbox.
+      #
+      # Both flags, always. They are each a no-op in one of the two shapes devkit
+      # generates: devkit declares a PEP 735 `dev` dependency-group and no extras, a
+      # generated project declares a `dev` extra and no groups. Passing both covers
+      # both. mypy comes along either way, which matters — devkit's own `lint-all.py`
+      # skips linters it cannot import, so omitting it would silently drop
+      # type-checking rather than fail.
+      #
+      # This project is the `dev` extra shape, and the sync also resolves the editable
+      # `data-lake` path dependency — which is why the clone action has to have run.
+      shell: bash
+      run: uv sync --all-extras --all-groups
