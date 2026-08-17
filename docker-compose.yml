@@ -20,7 +20,14 @@ services:
     ports:
       - "${DB_HOST_PORT:-5438}:5432"
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      # `/var/lib/postgresql`, NOT `/var/lib/postgresql/data`. The postgres:18+ images
+      # store data in a major-version-specific subdirectory (`18/docker`) so that
+      # `pg_upgrade --link` works across a version bump. Mounting the old `/data` path
+      # makes the image refuse to start ("there appears to be PostgreSQL data in
+      # /var/lib/postgresql/data (unused mount/volume)") and, worse, would not have
+      # persisted the real data directory even if it had.
+      # See https://github.com/docker-library/postgres/pull/1259
+      - pgdata:/var/lib/postgresql
     healthcheck:
       # Other services wait on this, so `up -d` returning means the DB is actually
       # accepting connections — not merely that the container started.

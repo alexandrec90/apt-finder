@@ -25,6 +25,11 @@ htmlcov/
 *.pem
 *.key
 
+# Browser profiles. `.local/facebook-profile/` holds a live, logged-in Facebook
+# session — cookies that are functionally a password. Committing it would hand the
+# account to anyone who can read the repo, so this must never be narrowed.
+.local/
+
 # Runtime output. `logs/` holds the diagnostic artifacts the fixer skills read;
 # they are regenerated on every run and must never be committed.
 logs/
