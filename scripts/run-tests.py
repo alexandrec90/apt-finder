@@ -89,7 +89,13 @@ def main(argv: list[str] | None = None) -> int:
     cmd += [a for a in extra if a]
 
     print(f"run-tests: {' '.join(cmd[2:])}")
-    result = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True)
+    # encoding/errors are explicit: `text=True` alone decodes with the locale default
+    # (cp1252 on Windows), and a failing test whose output carries an accent — this
+    # suite is full of French listing fixtures — would crash the reader thread and
+    # leave `stdout` as None. See the same note in `lint-all.py`.
+    result = subprocess.run(
+        cmd, cwd=REPO_ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace"
+    )
     raw = result.stdout + result.stderr
 
     ARTIFACT.parent.mkdir(parents=True, exist_ok=True)

@@ -28,6 +28,12 @@ unit_tests = "tests"
 max_bytes = 4000
 head_bytes = 2000
 
+# NB no `[watch]` block yet, deliberately. `enforce-watch-budget.py` reads
+# `[watch] max_wakeups`, but the vendored `harness_config.py` here is v0.6.0 and
+# has no such section — so `test_repo_contract.py` rejects the table as unknown,
+# and the hook falls back to its own default of 3. Add the block when the devkit
+# pin moves past the release that ships `WatchConfig`.
+
 # Tier 2b: host pytest against the DB over its published compose port.
 #
 # NOTE the port. `db_port` is the *host* port, so it differs per worktree — this

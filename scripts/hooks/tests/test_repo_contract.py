@@ -45,18 +45,29 @@ hook = load_module("scripts/hooks/stop.py")
 
 CFG = hook.CFG
 SETTINGS = REPO_ROOT / ".claude" / "settings.json"
+CODEX_HOOKS = REPO_ROOT / ".codex" / "hooks.json"
+CODEX_ROOT_PATH_RE = re.compile(
+    r'(?:\$\(git rev-parse --show-toplevel\)|__CODEX_PROJECT_ROOT__)/([^"\r\n]+)'
+)
+CODEX_LAUNCHER_ADAPTER_MARKER = "r/'scripts/hooks/codex-hook-adapter.py'"
 
 
 def _wires_stop_hook() -> bool:
     """True when this repo actually registers `stop.py` as a Stop hook.
 
-    The gate for every check below that reads the repo's shape off its manifest.
-    devkit itself is the case that needs it: it is the harness's source repo, not a
-    consumer of it, and its committed `.devkit.toml` is a deliberate *test
-    fixture* -- it turns on the DB and frontend tiers so the vendored suite exercises
-    them here, and describes a project shaped nothing like devkit. Asserting devkit's
-    files against that manifest would fail on a file the manifest never claimed
-    devkit has. A repo that wires the hook is making a real claim about itself.
+    The gate for every check below that reads the repo's shape off its manifest. A repo
+    that vendors these tests without wiring the hook has not adopted the tier they
+    describe, so asserting its files against a manifest nothing acts on would report a
+    failure about a tier nobody is running. Wiring the hook is the repo making a real
+    claim about itself.
+
+    This docstring used to justify the gate differently -- devkit's own `.devkit.toml`
+    being a *fixture* that "turns on the DB and frontend tiers" and describes a project
+    shaped nothing like devkit. That stopped being true when the manifest was rewritten
+    to describe devkit: both tiers are off, devkit does wire the hook, and the checks
+    below run here like anywhere else. The sentence outlived the fact by months, in a
+    file every project vendors — which is why a claim about a repo's shape belongs in
+    the assertion, where it fails, and not only in the prose above it.
     """
     try:
         settings = json.loads(SETTINGS.read_text(encoding="utf-8"))
@@ -91,7 +102,7 @@ def _toml_schema() -> dict[str, frozenset[str]]:
     keys (`[paths] app` -> `app_dir`); the rest map 1:1 onto their dataclass, so
     they are derived and cannot drift as fields are added.
     """
-    fields = lambda dc: frozenset(f.name for f in dataclasses.fields(dc))  # noqa: E731
+    fields = lambda dc: frozenset(f.name for f in dataclasses.fields(dc))
     return {
         "project": frozenset({"env_prefix"}),
         "paths": frozenset({"app", "tests", "unit_tests"}),
@@ -261,6 +272,81 @@ def test_frontend_paths_exist_when_the_tier_is_on():
         pytest.skip("project has no frontend tier")
     assert (REPO_ROOT / CFG.frontend.dir).is_dir(), f"[frontend] dir = {CFG.frontend.dir!r}"
     assert (REPO_ROOT / CFG.frontend.src).is_dir(), f"[frontend] src = {CFG.frontend.src!r}"
+
+
+# --- generated Codex handlers -------------------------------------------------
+
+
+def _codex_commands(payload: dict) -> list[tuple[str, str]]:
+    """Return ``(event, command)`` pairs without assuming a project's topology."""
+    commands: list[tuple[str, str]] = []
+    hooks = payload.get("hooks", {})
+    assert isinstance(hooks, dict), ".codex/hooks.json: `hooks` must be an object"
+    for event, groups in hooks.items():
+        assert isinstance(groups, list), f".codex/hooks.json: {event} must be a list"
+        for group in groups:
+            assert isinstance(group, dict), f".codex/hooks.json: {event} group must be an object"
+            handlers = group.get("hooks", [])
+            assert isinstance(handlers, list), f".codex/hooks.json: {event}.hooks must be a list"
+            for handler in handlers:
+                if not isinstance(handler, dict) or handler.get("type") != "command":
+                    continue
+                command = handler.get("command")
+                assert isinstance(command, str), (
+                    f".codex/hooks.json: {event} command hook has no string command"
+                )
+                commands.append((event, command))
+    return commands
+
+
+def _codex_command_paths(command: str) -> list[str]:
+    """Repo-relative files named by either generated launcher generation."""
+    paths = CODEX_ROOT_PATH_RE.findall(command)
+    if CODEX_LAUNCHER_ADAPTER_MARKER in command:
+        paths.append("scripts/hooks/codex-hook-adapter.py")
+    return paths
+
+
+def test_codex_command_paths_cover_the_launcher_and_handler():
+    command = (
+        "python3 -c \"r/'scripts/hooks/codex-hook-adapter.py'\" --event Stop -- "
+        'python3 "__CODEX_PROJECT_ROOT__/scripts/hooks/stop.py"'
+    )
+    assert _codex_command_paths(command) == [
+        "scripts/hooks/stop.py",
+        "scripts/hooks/codex-hook-adapter.py",
+    ]
+
+
+def test_generated_codex_handlers_exist():
+    """Every git-root path emitted into an opted-in repo must name a real file.
+
+    Converter unit tests prove the JSON rewrite. They cannot prove a consumer
+    received the adapter, session bridge, or project-owned handler named by that
+    JSON. This is the runtime half of the contract: an absent handler is a hook that
+    looks configured, is trusted successfully, and fails only when its event fires.
+    """
+    if not CODEX_HOOKS.is_file():
+        pytest.skip("repo has not opted into project-local Codex hooks")
+
+    try:
+        payload = json.loads(CODEX_HOOKS.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        pytest.fail(f"{CODEX_HOOKS.relative_to(REPO_ROOT)} is invalid JSON: {exc}")
+
+    missing: list[str] = []
+    referenced = 0
+    for event, command in _codex_commands(payload):
+        assert "${CLAUDE_PROJECT_DIR" not in command, (
+            f"{event} still contains Claude's project-dir placeholder: {command}"
+        )
+        for relative in _codex_command_paths(command):
+            referenced += 1
+            if not (REPO_ROOT / relative).is_file():
+                missing.append(f"{event}: {relative}")
+
+    assert referenced, ".codex/hooks.json contains no repo-root handler paths to validate"
+    assert not missing, "generated Codex hook handler(s) are missing:\n  " + "\n  ".join(missing)
 
 
 # --- the instruction tier -----------------------------------------------------

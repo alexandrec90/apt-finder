@@ -1,0 +1,74 @@
+name: Nightly
+
+# The scheduled full run against the default branch. The PR gate only fires on a
+# change, so it is structurally blind to every failure that arrives without one: a
+# dependency published inside this project's version bounds, a runner image bump, an
+# expired credential, a test that is flaky rather than broken.
+#
+# This repo has a specific reason to want one. `data-lake` is an editable path
+# dependency cloned from its **default branch**, not a pinned ref — the PR gate's own
+# comment accepts that "a bad push to data-lake reddens this repo's gate". Without a
+# nightly, it reddens it only for whoever happens to open the next PR, days later.
+#
+# `cancel-in-progress: false` is deliberate and is asserted by the vendored
+# `test_ci_workflow_contract.py` — a scheduled run that cancels itself reports nothing
+# on exactly the night two runs overlap.
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  full-suite:
+    name: Full suite
+    runs-on: ubuntu-latest
+    services:
+      db:
+        image: postgres:18
+        env:
+          POSTGRES_USER: apt_finder
+          POSTGRES_PASSWORD: apt_finder_local_dev # pragma: allowlist secret
+          POSTGRES_DB: apt_finder
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      # The `pragma` must stay on the same line as the value — detect-secrets matches
+      # its allowlist comment per-line. Credentials of a service container that lives
+      # for one job.
+      DATABASE_URL: postgresql+psycopg://apt_finder:apt_finder_local_dev@127.0.0.1:5432/apt_finder # pragma: allowlist secret
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/checkout-data-lake
+        with:
+          data-lake-token: ${{ secrets.DATA_LAKE_TOKEN }}
+      - uses: ./.github/actions/setup-python-env
+        with:
+          python-version: "3.12"
+      - name: Apply migrations
+        run: uv run python -m alembic upgrade head
+      - name: Application suite
+        run: uv run python scripts/run-tests.py
+      - name: Harness hook tests
+        run: uv run python -m pytest scripts/hooks/tests/ -q
+      - name: Lint
+        run: uv run python scripts/lint-all.py
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: nightly-failures
+          path: logs/
+          if-no-files-found: ignore

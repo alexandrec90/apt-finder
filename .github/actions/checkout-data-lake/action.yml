@@ -1,0 +1,71 @@
+name: Check out the sibling data-lake package
+description: >-
+  Clone the private sibling data-lake repository next to this checkout, so the
+  editable path dependency in pyproject.toml can resolve. Run this BEFORE
+  `./.github/actions/setup-python-env`, whose `uv sync` is what needs it.
+
+  This used to be the first step of that action. It moved out when devkit v0.7.0 began
+  vendoring `setup-python-env/action.yml` byte-identical from the shared repo — a
+  vendored file cannot carry one project's private sibling, and keeping the step there
+  would have been reported as drift forever. Splitting it is also the more honest
+  shape: cloning a private sibling was never part of setting up Python.
+
+inputs:
+  data-lake-token:
+    description: >-
+      Token with read access to the sibling data-lake repository. That repo is
+      private, and the default GITHUB_TOKEN is scoped to this repository alone, so
+      without this the checkout below cannot see it. Empty falls back to
+      GITHUB_TOKEN, which is the correct behaviour if data-lake is ever made public.
+      Callers must pass it explicitly — composite actions cannot read `secrets`.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Check out the sibling data-lake package
+      # `[tool.uv.sources]` declares data-lake as an editable path dependency at
+      # `../data-lake`, so `uv sync` cannot resolve until that directory exists. On a
+      # runner `../` is the work directory that contains the checkout — writable, but
+      # OUTSIDE $GITHUB_WORKSPACE, which is why this is a git clone and not
+      # actions/checkout (that action refuses a path above the workspace).
+      #
+      # Deliberately the default branch, not a pinned ref, unlike the devkit checkout
+      # in pr-gate.yml. An editable path dependency records no revision in uv.lock —
+      # locally it is whatever the developer has checked out — so pinning here would
+      # gate against a lake the author never ran. The cost is real and accepted: a
+      # bad push to data-lake reddens this repo's gate.
+      shell: bash
+      env:
+        DATA_LAKE_SLUG: alexandrec90/data-lake
+        # Never interpolated into the script body: an `${{ }}` expression there is
+        # substituted before bash sees it, which makes the value part of the program.
+        DATA_LAKE_TOKEN: ${{ inputs.data-lake-token || github.token }}
+        # Whether the secret reached the job — a boolean, never the value. Both tokens
+        # arrive masked as `***` in the log, and GitHub answers a 404 either way, so
+        # without this the clone failure cannot say which remedy applies.
+        DATA_LAKE_TOKEN_SUPPLIED: ${{ inputs.data-lake-token != '' }}
+        TARGET_DIR: ${{ github.workspace }}/../data-lake
+      run: |
+        set -euo pipefail
+        if [ -d "${TARGET_DIR}/.git" ]; then
+          echo "data-lake already present at ${TARGET_DIR}"
+          exit 0
+        fi
+        # Basic auth in an `-c` override rather than in the clone URL: `-c` applies to
+        # this invocation only, so the token is never written into the clone's
+        # .git/config where a later `git remote -v` would print it.
+        auth="$(printf 'x-access-token:%s' "${DATA_LAKE_TOKEN}" | base64 -w0)"
+        if ! git -c "http.extraheader=AUTHORIZATION: basic ${auth}" \
+             clone --depth 1 "https://github.com/${DATA_LAKE_SLUG}.git" "${TARGET_DIR}"; then
+          # git says "Repository not found" for a private repo the token cannot see and
+          # for one that does not exist, so the message has to come from what the job
+          # knows rather than from what git reported.
+          if [ "${DATA_LAKE_TOKEN_SUPPLIED}" = "true" ]; then
+            echo "::error::Could not clone ${DATA_LAKE_SLUG} using the DATA_LAKE_TOKEN secret. The secret is set and did reach this job, so the token itself cannot read that repository — GitHub returns 'not found' rather than 'forbidden' for a private repo outside a token's scope. Reissue it with read access to ${DATA_LAKE_SLUG}: a fine-grained PAT must list that repository explicitly, and a classic PAT needs the 'repo' scope. The editable path dependency in pyproject.toml cannot resolve until it can."
+          else
+            echo "::error::Could not clone ${DATA_LAKE_SLUG}: no DATA_LAKE_TOKEN secret is set, so the clone fell back to this job's GITHUB_TOKEN, which is scoped to ${GITHUB_REPOSITORY} alone and cannot read a private sibling. Add a DATA_LAKE_TOKEN repository secret (Settings -> Secrets and variables -> Actions) holding a token with read access to ${DATA_LAKE_SLUG}, or make that repository public. The editable path dependency in pyproject.toml cannot resolve until one of those happens."
+          fi
+          exit 1
+        fi
