@@ -9,18 +9,6 @@
     "OTEL_LOGS_EXPORT_INTERVAL": "5000",
     "OTEL_RESOURCE_ATTRIBUTES": "service.name=apt-finder,service.instance.id=apt-finder,deployment.environment=local"
   },
-  "permissions": {
-    "allow": [
-      "Bash(*)",
-      "Read(*)",
-      "Edit(*)",
-      "Write(*)",
-      "Grep(*)",
-      "Glob(*)",
-      "WebFetch(*)",
-      "WebSearch(*)"
-    ]
-  },
   "hooks": {
     "SessionStart": [
       {
