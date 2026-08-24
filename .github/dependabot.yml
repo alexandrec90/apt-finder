@@ -7,12 +7,17 @@
 # `assignees` is per-entry and not optional: a Dependabot PR has no author, mention or
 # review request that belongs to a human, so an unassigned one appears under no tab on
 # github.com/pulls and is reachable only by opening this repository.
+#
+# This project is paused. GitHub documents `open-pull-requests-limit: 0` as the
+# reversible way to disable version updates for one package ecosystem; keep it on
+# every entry until maintenance resumes.
 version: 2
 updates:
   - package-ecosystem: uv
     directory: /
     schedule:
       interval: weekly
+    open-pull-requests-limit: 0
     assignees:
       - alexandrec90
     groups:
@@ -27,6 +32,7 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    open-pull-requests-limit: 0
     assignees:
       - alexandrec90
     groups:
@@ -42,6 +48,7 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    open-pull-requests-limit: 0
     assignees:
       - alexandrec90
     ignore:
