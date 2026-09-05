@@ -112,7 +112,15 @@ def _toml_schema() -> dict[str, frozenset[str]]:
         "python": fields(cfg.PythonConfig),
         "bash": fields(cfg.BashConfig),
         "docker": fields(cfg.DockerConfig),
+        "worktree": fields(cfg.WorktreeConfig),
+        "test_contract": fields(cfg.TestContractConfig),
+        "structure": fields(cfg.StructureConfig),
     }
+
+
+def test_manifest_schema_covers_worktree_config() -> None:
+    fields = frozenset(f.name for f in dataclasses.fields(cfg.WorktreeConfig))
+    assert _toml_schema()["worktree"] == fields
 
 
 def test_manifest_has_no_unknown_keys():
@@ -703,3 +711,324 @@ def test_vendored_skills_are_not_locally_edited():
             f"{skill.relative_to(REPO_ROOT)} names a specific default branch; the "
             "vendored copy must defer to the one detect_default_branch() resolves"
         )
+
+
+# --- no repo defines its own VS Code tasks ------------------------------------
+# Ungated, like the ignore check below it: a stray `tasks.json` is a hazard whether or
+# not this repo has wired the Stop tier, and VS Code can write one into a checkout that
+# has adopted nothing at all.
+
+PROJECT_TASKS = REPO_ROOT / ".vscode" / "tasks.json"
+
+
+def strip_jsonc(text: str) -> str:
+    """Blank `//` and `/* */` comments outside strings, then drop trailing commas.
+
+    `.vscode/tasks.json` is JSONC and `json` is not, and the obvious shortcut -- drop
+    lines whose first non-space characters are `//` -- gets both halves of a real file
+    wrong: it keeps an inline comment after a value, and it deletes a `"detail"` whose
+    text happens to start with a URL. This walks the string state instead, which is the
+    only way to tell a comment from those two.
+    """
+    out: list[str] = []
+    i, end = 0, len(text)
+    in_string = False
+    while i < end:
+        ch = text[i]
+        if in_string:
+            out.append(ch)
+            if ch == "\\" and i + 1 < end:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                in_string = False
+            i += 1
+            continue
+        if ch == '"':
+            in_string = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "/" and text[i + 1 : i + 2] == "/":
+            while i < end and text[i] != "\n":
+                i += 1
+            continue
+        if ch == "/" and text[i + 1 : i + 2] == "*":
+            i += 2
+            while i < end and text[i : i + 2] != "*/":
+                i += 1
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    return re.sub(r",(\s*[}\]])", r"\1", "".join(out))
+
+
+def hoisted_task_problems(text: str) -> list[str]:
+    """What is wrong with a `.vscode/tasks.json`, or an empty list if nothing is.
+
+    Present-and-empty is legal and is what the generator renders: the file is kept for
+    the policy comment that stops the next author re-adding a task, so its `tasks` and
+    `inputs` must both be `[]`. Anything else is an entry that has to move.
+    """
+    try:
+        parsed = json.loads(strip_jsonc(text))
+    except json.JSONDecodeError as exc:
+        return [f"does not parse even as JSONC ({exc})"]
+    if not isinstance(parsed, dict):
+        return [f"is not an object but a {type(parsed).__name__}"]
+    problems = []
+    for key in ("tasks", "inputs"):
+        entries = parsed.get(key, [])
+        if not isinstance(entries, list):
+            problems.append(f"{key!r} is not a list")
+        elif entries:
+            named = [
+                e.get("label") or e.get("id") or "<unlabelled>"
+                for e in entries
+                if isinstance(e, dict)
+            ]
+            problems.append(f"defines {len(entries)} {key}: {', '.join(named) or entries}")
+    return problems
+
+
+def test_no_repo_defines_its_own_vscode_tasks():
+    """Tasks live once in the shared workspace file, never in a repo.
+
+    Three things break when one is defined here instead. It is invisible from the
+    workspace root, it cannot be scoped with `devkit_project.Action.projects`, and --
+    the arithmetic that actually forces the rule -- a task defined in a repo is
+    rendered once per WORKTREE. The workspace holds an ephemeral agent box per task in
+    flight, so a single entry becomes N quick-pick rows carrying the same label with
+    nothing to say which checkout each would run in. When the last of these files were
+    deleted, carameli's two copies had drifted to eight tasks versus two and
+    ibkr_trader's to five versus eleven, with the same label running different commands.
+
+    A test is what enforces it because **VS Code writes this file itself**: configuring
+    an auto-detected npm script emits a `tasks.json` with no author and no review, and
+    it rides into main inside whatever PR happened to be open. That is exactly how
+    carameli's came back on 2026-08-28 -- a single "npm: build - frontend" stub wrapping
+    `frontend`'s own `build` script, in a PR that added an image asset, three weeks
+    after a sweep had deleted the 85-line file it replaced. Nothing read it and nothing
+    ran it; the frontend build was already reachable from the shared block.
+
+    Vendored rather than written per project because every consumer is a folder in the
+    one multi-root workspace by construction -- `new-project.py` registers there and
+    ships no `.code-workspace` of its own -- which is the same assumption `sweep.py`
+    already makes when it reads that `folders` list as the project registry.
+
+    What a repo owes instead is the CLI contract: a `scripts/<name>.py` at the path
+    `devkit_project.ACTIONS` names. A task that cannot be expressed that way is not
+    blocked from hoisting -- write the seam.
+    """
+    if not PROJECT_TASKS.is_file():
+        return
+    problems = hoisted_task_problems(PROJECT_TASKS.read_text(encoding="utf-8"))
+    assert not problems, (
+        f".vscode/tasks.json {'; '.join(problems)} -- move each one into the shared "
+        "task block in alex-projects.code-workspace (edit devkit's canonical "
+        "workspace.jsonc, on a branch) and scope it with Action.projects. Keep this "
+        "file only for its policy comment, with empty `tasks` and `inputs`."
+    )
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_empty"),
+    [
+        ('{"version": "2.0.0", "tasks": [], "inputs": []}', True),
+        # The generator's stub: the comment is the whole point of the file.
+        ('{\n// no tasks here on purpose\n"version": "2.0.0", "tasks": []\n}', True),
+        # No `tasks` key at all is still nothing hoisted.
+        ('{"version": "2.0.0"}', True),
+        # A `//` inside a string is data, not a comment -- the line-prefix shortcut
+        # keeps this file's closing brace and then fails to parse it.
+        ('{"tasks": [], "detail": "see https://example.test/x"}', True),
+        # The real regression, verbatim in shape.
+        (
+            '{"tasks": [{"type": "npm", "script": "build", "label": "npm: build - frontend"}]}',
+            False,
+        ),
+        # An input with no task is still a project-level definition.
+        ('{"tasks": [], "inputs": [{"id": "target"}]}', False),
+        ("{not json at all", False),
+    ],
+)
+def test_hoisted_task_scanner_reads_the_entries_not_the_formatting(text, expected_empty):
+    """The scanner decides on parsed entries, so comments and layout cannot fool it.
+
+    devkit itself ships no `.vscode/tasks.json`, so the test above passes here without
+    ever reaching its assertion. These cases are what actually exercise the check in
+    the repo that vendors it.
+    """
+    assert (hoisted_task_problems(text) == []) is expected_empty
+
+
+# --- a hook that decodes a child's output names the codec --------------------
+
+DECODES_OUTPUT = {"text", "universal_newlines"}
+NAMES_A_CODEC = {"encoding", "errors"}
+
+
+def undecoded_captures(source: str) -> list[int]:
+    """Line numbers where a subprocess in `source` decodes output with no codec named.
+
+    Read with `ast` rather than by importing: these are hook modules, and importing one
+    to inspect it runs its config load against whatever repo the test happens to sit in.
+    Matching is on the *call* (`run`, `Popen`, `check_output`) plus a `text=`/
+    `universal_newlines=` keyword, which no other API in this tier takes -- so an alias
+    or a `sp.run` spelling is caught, and nothing else is.
+    """
+    lines = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+        if name not in {"run", "Popen", "check_output"}:
+            continue
+        kwargs = {kw.arg for kw in node.keywords if kw.arg}
+        if kwargs & DECODES_OUTPUT and not NAMES_A_CODEC <= kwargs:
+            lines.append(node.lineno)
+    return lines
+
+
+def test_undecoded_capture_scanner_reads_the_keywords_not_the_spelling():
+    """The scanner's own cases, so a rewrite of it cannot quietly stop finding any."""
+    assert undecoded_captures("subprocess.run(argv, capture_output=True, text=True)") == [1]
+    assert undecoded_captures("sp.run(argv, text=True, encoding='utf-8')") == [1]
+    assert undecoded_captures("run(argv, universal_newlines=True)") == [1]
+    assert (
+        undecoded_captures("subprocess.run(argv, text=True, encoding='utf-8', errors='replace')")
+        == []
+    )
+    # No decoding asked for: bytes come back, and there is no codec to get wrong.
+    assert undecoded_captures("subprocess.run(argv, capture_output=True)") == []
+
+
+def test_every_capture_in_a_vendored_hook_declares_its_codec():
+    """A hook that decodes a child's output names its codec and its error policy.
+
+    `text=True` on its own decodes through `locale.getencoding()` -- cp1252 on a Windows
+    workstation, strict UTF-8 on a CI runner -- and real tools emit bytes that both
+    reject: box-drawing and curly quotes from ruff, a path or branch name from git. The
+    `UnicodeDecodeError` is raised in subprocess's **reader thread**, so no `try` around
+    the call can see it, and `subprocess.run` returns a `CompletedProcess` whose `stdout`
+    and `stderr` are both `None`. The crash therefore surfaces wherever those are first
+    used -- a Stop hook died on `unsupported operand type(s) for +: 'NoneType' and
+    'NoneType'` while assembling a failure tail, hundreds of lines from the call that
+    could not read one, with the decode error visible only as two orphan thread
+    tracebacks above it.
+
+    Scoped to the vendored hooks, which is where it costs the most and where the fix
+    ships: a crashing PostToolUse hook blocks every edit, and a crashing Stop hook ends
+    the session having written no artifact. The vendored *tests* are deliberately out of
+    scope -- a decode failure there is a red test that names itself, in CI, where
+    somebody reads it.
+    """
+    sync = load_module("scripts/sync-devkit.py")
+    offenders = {}
+    for rel in sync.MANIFEST:
+        if not rel.startswith("scripts/hooks/") or not rel.endswith(".py"):
+            continue
+        if "/tests/" in rel:
+            continue
+        path = REPO_ROOT / rel
+        if not path.is_file():
+            continue
+        found = undecoded_captures(path.read_text(encoding="utf-8"))
+        if found:
+            offenders[rel] = found
+    assert not offenders, (
+        "these hooks capture a child's output without naming a codec: "
+        + "; ".join(f"{rel}:{lines}" for rel, lines in sorted(offenders.items()))
+        + " -- pass encoding='utf-8', errors='replace' as well, per the codec note "
+        "under VERIFY_IMPORT in scripts/hooks/stop.py"
+    )
+
+
+# --- and a hook that reads its own payload names it too -----------------------
+
+
+def undecoded_stdin(source: str) -> list[int]:
+    """Line numbers where `source` reads stdin through whatever codec the platform picked.
+
+    The mirror image of `undecoded_captures`, on the *input* side and with the same
+    failure: `sys.stdin.read()` decodes through `locale.getencoding()`, cp1252 on a
+    Windows workstation, and the harness writes every hook UTF-8 JSON.
+
+    A read is excused by either of the two spellings that fix it, taken file-wide rather
+    than per-call: reading `sys.stdin.buffer` and decoding once, or `reconfigure`-ing the
+    stream before reading it. File-wide because both fixes put the excusing line in a
+    different statement from the read -- a `buffer` reader keeps `sys.stdin.read()` as
+    its fallback for a stub with no buffer, which is the very line this looks for.
+    """
+    if "sys.stdin.buffer" in source or 'getattr(sys.stdin, "buffer"' in source:
+        return []
+    if "sys.stdin.reconfigure(" in source:
+        return []
+    lines = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not isinstance(func, ast.Attribute) or func.attr not in {"read", "readline"}:
+            continue
+        inner = func.value
+        if isinstance(inner, ast.Attribute) and inner.attr == "stdin":
+            lines.append(node.lineno)
+    return lines
+
+
+def test_undecoded_stdin_scanner_reads_the_call_not_the_spelling():
+    """The scanner's own cases, so a rewrite of it cannot quietly stop finding any."""
+    assert undecoded_stdin("import sys\nraw = sys.stdin.read()\n") == [2]
+    assert undecoded_stdin("data = json.loads(sys.stdin.read())\n") == [1]
+    assert undecoded_stdin("sys.stdin.reconfigure(encoding='utf-8')\nsys.stdin.read()\n") == []
+    assert undecoded_stdin("raw = sys.stdin.buffer.read().decode('utf-8')\n") == []
+    # A file object that is not stdin decodes through whatever opened it, which is the
+    # opener's business.
+    assert undecoded_stdin("handle.read()\n") == []
+
+
+def test_every_vendored_hook_decodes_its_payload_as_utf8():
+    """A hook reads UTF-8 JSON from the harness; the platform codec is never what it is.
+
+    Two reports, one root cause, and both landed in the agent's own work rather than in a
+    stack trace. `worktree-guard.py` is the hook that *echoes the payload back* through
+    `updatedInput`, so a `Write` carrying U+2192 was re-aimed into a box with the arrow
+    mangled to three characters -- only the first write of a session, the one the guard
+    re-aims, so nothing but a spellchecker ever caught it. The same read made
+    `redirect_blocker` refuse an `Edit` with "the box's copy of the file does not contain
+    the text this edit replaces" against a byte-identical file: the box copy is read as
+    UTF-8 and the `old_string` had come through cp1252, so any em dash in the replaced
+    text made them disagree.
+
+    Neither hook raised, which is what makes this worth a ratchet rather than a fix: a
+    codec error on the *output* side crashes and gets found, and on the input side it
+    quietly rewrites what the agent typed.
+
+    Scoped like its sibling above: the vendored hooks, where the fix ships. The two
+    non-vendored entry points that also read a payload -- `worktree-guard.py` and
+    `task_slug.py` -- are devkit's own and covered by `tests/test_worktree_guard.py`.
+    """
+    sync = load_module("scripts/sync-devkit.py")
+    offenders = {}
+    for rel in sync.MANIFEST:
+        if not rel.startswith("scripts/hooks/") or not rel.endswith(".py"):
+            continue
+        if "/tests/" in rel:
+            continue
+        path = REPO_ROOT / rel
+        if not path.is_file():
+            continue
+        found = undecoded_stdin(path.read_text(encoding="utf-8"))
+        if found:
+            offenders[rel] = found
+    assert not offenders, (
+        "these hooks read their payload through the platform codec: "
+        + "; ".join(f"{rel}:{lines}" for rel, lines in sorted(offenders.items()))
+        + " -- read sys.stdin.buffer and decode('utf-8', errors='replace') once, or "
+        "reconfigure the stream first, per the codec note under VERIFY_IMPORT in "
+        "scripts/hooks/stop.py"
+    )

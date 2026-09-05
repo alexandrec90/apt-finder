@@ -184,21 +184,63 @@ def reference_pattern(symbol: str) -> re.Pattern[str]:
 
 
 def module_pattern(module: Path) -> re.Pattern[str]:
-    """Matches a test file's mention of `module`, in either spelling.
+    """Matches a test file's mention of `module`, in a spelling that names the module.
 
     A hyphenated script is loaded by path (`'scripts/sync-devkit.py'`) and imported
     under an underscored name (`sync_devkit`); a test may use either, and a test using
     neither is not the one covering it.
+
+    The four accepted spellings are the four ways a test can actually reach a module:
+    the file name, an `import`, an attribute off it, and a binding of it to a name. A
+    **bare stem anywhere in the file** used to count, and that is a substring match with
+    a word boundary painted on: `test_run_tests.py` asserting `'--ignore=tests/local_e2e'`
+    pulled that whole file into `scripts/local-e2e.py`'s corpus, where an unrelated
+    `rt.main(` then satisfied `reference_pattern('main')` and `local-e2e.py::main` read
+    as covered. That is a **false negative** in the debt list -- the one failure mode
+    this module's opening claims it does not have -- and the ratchet turns it into
+    pressure to delete a real gap from the baseline as "now covered".
+
+    The file-name spelling is still a plain substring, deliberately: a test that names
+    `scripts/acme-tool.py` in a docstring joins its corpus, because that is also how a
+    test loading it by path spells it and the two are not distinguishable. That is the
+    conservative direction -- it can only admit a test, and `reference_pattern` still has
+    to find the symbol inside it.
     """
-    stem = re.escape(module.stem)
+    filename = re.escape(module.name)
     snake = re.escape(module.stem.replace("-", "_"))
-    return re.compile(rf"\b{stem}\b|\b{snake}\b")
+    return re.compile(
+        rf"\b{filename}\b"  # path spelling: 'scripts/sync-devkit.py'
+        rf"|^\s*(?:import|from)\s+.*\b{snake}\b"  # import sync_devkit / from x import ...
+        rf"|\b{snake}\s*\."  # sync_devkit.main
+        rf"|\b{snake}\b\s*=",  # sync_devkit = load(...)
+        re.MULTILINE,
+    )
 
 
 def corpus_for(module: Path, texts: dict[Path, str]) -> str:
-    """The text of every test file that mentions `module`, concatenated."""
+    """The text of every test file that mentions `module`, concatenated.
+
+    The substring test in front of the regex is a **necessary condition of every
+    alternative** {@link module_pattern} accepts -- each one contains either the file
+    name or the underscored stem literally -- so it can only skip a file the pattern
+    would have rejected anyway, and `test_the_prefilter_cannot_skip_a_real_mention`
+    pins that.
+
+    It is here because this scan is quadratic and the regex is the expensive half:
+    every module is searched against every test file, and `.*\\b<stem>\\b` under
+    `re.MULTILINE` backtracks per line. On a repo with 235 modules and 166 test files
+    -- 1.4 MB of corpus, which is nothing -- the whole scan took 60s and tripped the
+    60s timeout on `test_every_public_symbol_is_named_by_a_test`; a `in` check that
+    settles the same question for most pairs brings it to about 4s. A timing-out gate
+    is not a slow gate, it is a red one, and the failure names a regex rather than the
+    coverage it was asked about.
+    """
     mentions = module_pattern(module)
-    return "\n".join(text for text in texts.values() if mentions.search(text))
+    name = module.name
+    snake = module.stem.replace("-", "_")
+    return "\n".join(
+        text for text in texts.values() if (name in text or snake in text) and mentions.search(text)
+    )
 
 
 def entry(module: Path, symbol: str) -> str:

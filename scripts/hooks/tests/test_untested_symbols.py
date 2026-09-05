@@ -136,12 +136,57 @@ def test_the_corpus_is_only_the_tests_that_name_the_module():
     assert "beta" not in corpus
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "assert '--ignore=tests/acme_tool' in ADDOPTS",  # a path that merely contains it
+        "# acme_tool is the one this does NOT cover",  # prose naming the module
+        "acme_tool_helpers.alpha()",  # a longer name that starts with it
+    ],
+)
+def test_a_module_named_only_in_passing_does_not_join_its_corpus(text):
+    """The false vouch this rules out, and it is the one the opening docstring claims
+    cannot happen: a bare stem match is a substring match with a word boundary painted
+    on. `test_run_tests.py` asserting `'--ignore=tests/local_e2e'` pulled that whole file
+    into `scripts/local-e2e.py`'s corpus, where an unrelated `rt.main(` satisfied
+    `reference_pattern('main')` -- so `local-e2e.py::main` read as covered and the stale
+    half of the ratchet then demanded its line be deleted from the baseline."""
+    assert not us.module_pattern(Path("scripts/acme-tool.py")).search(text)
+
+
+def test_a_symbol_is_not_vouched_for_by_a_file_that_merely_mentions_its_module():
+    """The same defect at the level the gate actually reports: end to end, through
+    `corpus_for`, the pairing that produced a wrong "now covered" verdict."""
+    texts = {Path("tests/test_run_tests.py"): "assert '--ignore=tests/acme_tool' in A\nrt.alpha()"}
+    assert "alpha" not in us.corpus_for(Path("scripts/acme-tool.py"), texts)
+
+
 def test_the_corpus_admits_a_sibling_that_names_the_module():
     """The other half of the scoping: a helper covered through the caller that
     exercises it is covered, and a gate insisting on `test_<stem>.py` would say
     otherwise and be wrong."""
     texts = {Path("tests/test_caller.py"): "import acme\nacme.alpha()"}
     assert "alpha" in us.corpus_for(Path("scripts/acme.py"), texts)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "load_module('scripts/acme-tool.py')",  # the file name
+        "import acme_tool",  # an import
+        "acme_tool.alpha()",  # an attribute off it
+        "acme_tool = load_module('x')",  # a binding
+    ],
+)
+def test_the_prefilter_cannot_skip_a_real_mention(text):
+    """`corpus_for` settles most (module, file) pairs with a substring check before it
+    runs the regex, and that is sound only while **every** alternative the pattern
+    accepts contains the file name or the underscored stem literally. Add one that does
+    not and this fails, instead of every corpus quietly shrinking and the gate reporting
+    gaps that are covered."""
+    module = Path("scripts/acme-tool.py")
+    assert us.module_pattern(module).search(text)
+    assert text in us.corpus_for(module, {Path("tests/test_acme.py"): text})
 
 
 # --- source_dirs / source_files / test_files ----------------------------------

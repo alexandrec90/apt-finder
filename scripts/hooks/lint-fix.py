@@ -61,7 +61,10 @@ try:
     import harness_config
     import harness_events
 except ImportError:  # pragma: no cover - a partially vendored consumer
-    harness_events = None  # type: ignore[assignment]
+    # One statement, one suppression: the structural gate counts each `type: ignore` as
+    # something somebody chose to write, and two lines here would be two of them saying
+    # the identical thing about the identical fallback.
+    harness_config = harness_events = None  # type: ignore[assignment]
 
 ALLOWED_TOOLS = {"Edit", "Write", "MultiEdit", "apply_patch", "create_file"}
 REPO_ROOT = (Path(__file__).parent / "../..").resolve()
@@ -77,6 +80,21 @@ REPO_ROOT = (Path(__file__).parent / "../..").resolve()
 # the primary's git dir, and requiring a directory would put every box back outside
 # every project.
 PROJECT_MARKERS = ("ruff.toml", ".ruff.toml", "pyproject.toml")
+
+# Rules whose verdict is a statement about a *finished* file, evaluated here against a
+# half-written one. `F401` is the whole list: adding `import os` and then, in the next
+# edit, the function that uses it is the normal order for an incremental change, and this
+# hook fires between the two -- so `--fix` deleted the import every time, and the F821 it
+# became surfaced an edit later, pointing at the second edit rather than at the deletion.
+# It has cost two sessions in the harness-events ledger (2026-08-22, 2026-08-23).
+#
+# Neither half of that can stay. Left fixable it is silently deleted; merely made
+# unfixable it would be *reported*, which for this hook means blocking the edit that
+# added the import -- worse, because it arrives immediately and reads as a rule against
+# writing imports. So it is dropped from both runs, and the claim it makes is left to the
+# place that can make it honestly: `lint-all.py`, the pre-commit gate and CI all see the
+# file whole. That is the same line this hook already draws around mypy and vulture.
+MID_EDIT_RULES = ("F401",)
 PATCH_PATH_RE = re.compile(
     r"^\*\*\* (?:Add File|Update File|Delete File|Move to): (.+?)\s*$",
     re.MULTILINE,
@@ -197,10 +215,23 @@ def _run(ruff: str, *args: str, cwd: Path = REPO_ROOT) -> subprocess.CompletedPr
         capture_output=True,
         check=False,
         text=True,
+        # UTF-8 rather than the platform codec: ruff's diagnostics carry box-drawing and
+        # curly quotes, and `text=True` alone decodes them through cp1252 on Windows,
+        # where an unmapped byte raises inside subprocess's reader thread. That would
+        # fail this hook -- which runs after *every* edit -- on the tool's output rather
+        # than on the file's contents. The full account is the codec note under
+        # `VERIFY_IMPORT` in stop.py, which is where this crashed a session first.
+        encoding="utf-8",
+        errors="replace",
     )
 
 
 def main() -> int:
+    # `is not None` because this hook tolerates a partially vendored consumer whose
+    # sibling import failed; there the switch is simply unreadable and the hook runs.
+    if harness_config is not None and harness_config.hooks_off("lint-fix"):
+        return 0
+
     hook_input = parse_hook_input(_read_stdin())
     paths = [path for path in extract_paths(hook_input) if is_lintable(path)]
     if not paths:
@@ -239,11 +270,14 @@ def main() -> int:
         file_arg = ruff_arg(target, root)
         # Deterministic auto-fixers first, silently: formatting and import sorting
         # should never reach the agent as "errors" — they just get applied.
+        mid_edit = ",".join(MID_EDIT_RULES)
         _run(ruff, "format", file_arg, cwd=root)
-        _run(ruff, "check", "--fix", file_arg, cwd=root)
+        _run(ruff, "check", "--fix", "--unfixable", mid_edit, file_arg, cwd=root)
 
         # Whatever remains is a genuine finding ruff can't fix on its own.
-        remaining = _run(ruff, "check", file_arg, "--output-format=concise", cwd=root)
+        remaining = _run(
+            ruff, "check", "--ignore", mid_edit, file_arg, "--output-format=concise", cwd=root
+        )
         if remaining.returncode != 0:
             detail = (remaining.stdout + remaining.stderr).strip()
             failures.append(f"ruff found issues in {path} that need a manual fix:\n{detail}")
@@ -259,15 +293,15 @@ def record_block(paths: list[str], failures: list[str]) -> None:
     """One harness-events ledger line per blocking run, so a false-positive finding --
     the S603/T201-on-a-scratch-file class this hook has already shipped -- is
     diagnosable from `logs/harness-events.log` in the devkit checkout rather than from
-    the chat of whichever session it blocked. Best-effort: `harness_events.record`
-    resolves the ledger through `$DEVKIT_DIR` and no-ops (never raises) without one.
+    the chat of whichever session it blocked. Best-effort: `harness_events.ledger_path`
+    owns where that is, and `record` no-ops (never raises) when the answer is nowhere.
     """
     if harness_events is None:
         return
     harness_events.record(
         "lint-fix-block",
         (
-            ("project", REPO_ROOT.name),
+            ("project", harness_events.project_name(REPO_ROOT)),
             ("version", harness_config.harness_version(REPO_ROOT)),
             ("files", ";".join(paths)),
             ("detail", failures[0]),
@@ -276,10 +310,20 @@ def record_block(paths: list[str], failures: list[str]) -> None:
 
 
 def _read_stdin() -> str:
-    """Best-effort read of the hook payload; '' when stdin is a tty or unreadable."""
+    """Best-effort read of the hook payload; '' when stdin is a tty or unreadable.
+
+    Decoded as UTF-8 rather than through the platform codec, for the reason
+    `worktree-guard.read_stdin` sets out: the harness writes UTF-8 JSON and Windows
+    decodes stdin as cp1252. What this hook takes from the payload is a file path, so
+    the cost is a non-ASCII path silently missing the formatter rather than a corrupted
+    edit -- a quiet skip, which is the shape of failure this repo treats as worst.
+    """
     try:
         if sys.stdin is None or sys.stdin.isatty():
             return ""
+        buffer = getattr(sys.stdin, "buffer", None)
+        if buffer is not None:
+            return buffer.read().decode("utf-8", errors="replace")
         return sys.stdin.read()
     except (OSError, ValueError):
         return ""

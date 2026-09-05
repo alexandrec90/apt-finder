@@ -25,12 +25,28 @@ strongest verification happened before a commit and none happened after, which i
 backwards: the committed branch is exactly what CI will see. `changed_paths` is now
 unioned with `git diff --name-only origin/<default>...HEAD`.
 
+**And the tree is the session's, not this file's.** `CLAUDE_PROJECT_DIR` points the hook
+at the static checkout, so a session whose edits were all routed into an ephemeral box
+had its Stop gate verify a tree it never touched — blocking twice, in one recorded case,
+on failures belonging to the branch that checkout happened to be parked on. `verify_root`
+reads the workspace lease file and verifies the box this session holds; with no lease
+file, no entry, or no box tier at all — which is every consuming project — it is
+`REPO_ROOT` exactly as before.
+
+**And a session that wrote nothing is never blocked on what it found** —
+`stop_session.session_wrote_nothing`, which owns that claim and the incident behind it.
+
 **It runs up to `MAX_VERIFY_ROUNDS` rounds, blocking on all but the last.**
 `stop_hook_active` is a boolean, so honouring it alone meant verification ran on the
 first stop only: the agent was told what was broken, "fixed" it, stopped again, and the
 second stop skipped the checks entirely — a wrong fix ended the session looking green. A
 per-worktree round counter lets each fix be re-checked, and the final round reports
 without blocking so the cycle always terminates.
+
+**A check the budget stopped is unknown, and unknown does not block.** It reported
+nothing about the branch, so a round holding only stopped checks stands down after
+saying so — a retry would spend the same budget in the same place and ask again. A
+check that finished and failed still blocks, in the same round or any other.
 
 Failures are written to `logs/stop-verify.log` (and the tier-owned artifacts
 `logs/lint-errors.log` / `logs/test-failures.log`); the terminal gets a status line and
@@ -41,7 +57,8 @@ env_prefix`), gated on relevant files changing, and skips cleanly when tooling/i
 absent.
 
 `skin_changed` and the verification helpers (`stop_hook_active`, `verify_enabled`,
-`changed_paths`, `committed_paths`, `all_changed`, `blocked_rounds`, `should_block`,
+`session_id`, `sessions_match`, `session_box`, `verify_root`, `changed_paths`,
+`committed_paths`, `all_changed`, `blocked_rounds`, `should_block`,
 `select_checks`, `run_checks`) are pure and unit-tested
 (`scripts/hooks/tests/test_stop.py`); each external step is its own importable,
 independently tested script.
@@ -55,6 +72,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
 
@@ -63,6 +81,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import harness_config
+import stop_session
 import task_branch
 
 REPO_ROOT = (Path(__file__).parent / "../..").resolve()
@@ -97,6 +116,30 @@ TEST_ARTIFACT = "logs/test-failures.log"
 # the interaction, not of any project's shape.
 MAX_VERIFY_ROUNDS = 3
 
+# Seconds the whole verification tier gets, not one check. Every agent harness kills a
+# Stop hook that outruns its own ceiling, and a killed hook is the worst of the three
+# outcomes: it writes no artifact, prints nothing, and ends the session on "stop hook
+# failed" with no way to tell which tier hung -- so the agent learns only that the gate
+# is broken. A Codex session ended exactly 600s after its last message with
+# `logs/stop-verify.log` still empty, which is that shape. `run_checks` and
+# `_pytest_failures` spawned uncapped subprocesses, so a suite that waits on a prompt,
+# a port or a lock had no upper bound at all.
+#
+# One budget across the tiers rather than one per check, because a check cannot know
+# what the ones before it spent, and it is the *total* the harness measures. Well under
+# a 600s ceiling: a timeout has to be reportable, which means leaving room to write the
+# artifact and print.
+VERIFY_BUDGET_SECONDS = 420
+
+# How a stopped check announces itself, in the artifact and to `unfinished`. A check the
+# budget stopped reported nothing about the branch, and the gate must not read it as red:
+# see `verify`, where a round of nothing-but-these stands down instead of blocking.
+UNFINISHED_MARK = "Stopped: "
+
+# The pre-verification frontend typecheck, whose output goes to DEVNULL, gets its own
+# smaller cap: it is a side effect, and it must not be able to spend the gate's ceiling.
+TYPECHECK_TIMEOUT_SECONDS = 120
+
 # Interpreter candidates for the verification checks, relative to the repo root.
 VENV_PYTHONS = (".venv/Scripts/python.exe", ".venv/bin/python")
 # PATH interpreters to try when there is no venv and the launcher cannot run the
@@ -105,6 +148,26 @@ VENV_PYTHONS = (".venv/Scripts/python.exe", ".venv/bin/python")
 PATH_PYTHONS = ("python", "py")
 # Importing this is the cheapest proof an interpreter can run the checks at all.
 VERIFY_IMPORT = "pytest"
+
+# Every capture below decodes as UTF-8 with replacement, never through the platform's
+# locale codec. `text=True` alone picks cp1252 on Windows, and a byte that codepage does
+# not map -- 0x9d, which ruff, pytest and docker all emit inside box-drawing and curly
+# quotes -- raises `UnicodeDecodeError` *inside subprocess's reader thread*, where no
+# `try` in this file can see it. `subprocess.run` then returns a CompletedProcess whose
+# `stdout` and `stderr` are both **None** (`stdout[0] if stdout else None`, over the
+# buffer the dead thread never filled), so the visible failure is a TypeError a hundred
+# lines away in `run_checks`: `unsupported operand type(s) for +: 'NoneType' and
+# 'NoneType'`, with two thread tracebacks above it and nothing naming the tool whose
+# output could not be read. That is how this reached a user -- as a Stop hook crash
+# pointing at the line that assembles a tail rather than at the line that decodes one.
+#
+# A tail is diagnostic text. A replacement character in it costs a reader nothing;
+# failing to decode one costs the whole verification tier.
+#
+# Spelled out at every call site rather than shared through a constant, because
+# `subprocess.run` is an overloaded signature: a `**kwargs` dict makes the arguments
+# opaque to mypy and to `test_every_capture_in_a_hook_declares_its_codec`, which is the
+# ratchet that keeps the next capture from being added without one.
 
 
 @functools.cache
@@ -223,6 +286,8 @@ def _git_skin_status(repo_root: Path) -> str:
             cwd=repo_root,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
     except OSError:
         return ""
@@ -249,6 +314,38 @@ def stop_hook_active(raw_stdin: str) -> bool:
 def verify_enabled(env: Mapping[str, str]) -> bool:
     """False when the operator has opted out of pre-stop verification."""
     return env.get(SKIP_VERIFY_ENV) != "1"
+
+
+# --- Which tree this stop verifies -----------------------------------------
+#
+# Both tiers live in `stop_session.py`, which is where the reasoning for each is too:
+# this module was at the ceiling `.devkit-structure.txt` records for it, and neither tier
+# knows anything about the gate's checks or its verdict. Re-exported rather than reached
+# through the module, so every name this file has published stays published.
+BOXES_DIR_NAME = stop_session.BOXES_DIR_NAME
+LEASE_FILE_NAME = stop_session.LEASE_FILE_NAME
+SESSION_PREFIX_MIN = stop_session.SESSION_PREFIX_MIN
+BOX_KIND_TASK = stop_session.BOX_KIND_TASK
+session_id = stop_session.session_id
+sessions_match = stop_session.sessions_match
+session_box = stop_session.session_box
+verify_root = stop_session.verify_root
+
+
+def _repo_script(root: Path, default: Path) -> Path:
+    """`default`, re-rooted at `root` when that is a different tree.
+
+    The module constants stay the single spelling of each script's location -- and stay
+    monkeypatchable, which is how the "this project has no such script" tiers are
+    tested. When the tree being verified is a box, the same relative path inside it is
+    what the checks must run, because the box is the copy holding the change.
+    """
+    if root == REPO_ROOT:
+        return default
+    try:
+        return root / default.relative_to(REPO_ROOT)
+    except ValueError:
+        return default
 
 
 def changed_paths(porcelain: str) -> list[str]:
@@ -369,7 +466,13 @@ def _git(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
     """
     try:
         return subprocess.run(
-            ["git", *args], cwd=repo_root, capture_output=True, text=True, check=False
+            ["git", *args],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
         )
     except (OSError, subprocess.SubprocessError):
         return subprocess.CompletedProcess(list(args), 1, "", "")
@@ -445,6 +548,8 @@ def _compose_running_services(repo_root: Path = REPO_ROOT) -> set[str]:
             cwd=repo_root,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=15,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -467,6 +572,8 @@ def _compose_up_db_redis(repo_root: Path = REPO_ROOT) -> bool:
             cwd=repo_root,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=180,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -484,6 +591,8 @@ def _compose_stop(services: list[str], repo_root: Path = REPO_ROOT) -> None:
             cwd=repo_root,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=60,
         )
 
@@ -507,6 +616,8 @@ def _compose_host_port(
             cwd=repo_root,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=15,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -531,7 +642,7 @@ def host_db_env(repo_root: Path = REPO_ROOT) -> dict[str, str] | None:
     return env
 
 
-def test_runner_argv(targets: list[str]) -> tuple[list[str], str | None]:
+def test_runner_argv(targets: list[str], root: Path | None = None) -> tuple[list[str], str | None]:
     """(argv, artifact) for the application test tier.
 
     Prefers the project's own `run-tests.py`: it writes `logs/test-failures.log` with
@@ -543,32 +654,116 @@ def test_runner_argv(targets: list[str]) -> tuple[list[str], str | None]:
     `sys.executable -m pytest` -- which is that same interpreter, so the venv is
     preserved through the extra hop.
     """
-    if RUN_TESTS.exists():
-        return [verify_python(), str(RUN_TESTS), *targets], TEST_ARTIFACT
-    return [verify_python(), "-m", "pytest", *targets, "-q"], None
+    base = REPO_ROOT if root is None else root
+    runner = _repo_script(base, RUN_TESTS)
+    if runner.exists():
+        return [verify_python(base), str(runner), *targets], TEST_ARTIFACT
+    return [verify_python(base), "-m", "pytest", *targets, "-q"], None
+
+
+def verify_deadline(budget: float = VERIFY_BUDGET_SECONDS) -> float:
+    """A `time.monotonic()` stamp `budget` seconds from now, shared by every tier.
+
+    Monotonic on purpose: the gate has to survive a clock the OS steps under it, and a
+    wall-clock deadline can go backwards mid-run.
+    """
+    return time.monotonic() + budget
+
+
+def timeout_tail(argv: list[str]) -> str:
+    """What `logs/stop-verify.log` says about a check the budget stopped.
+
+    Says nothing about the code, because nothing is known about it: the check did not
+    finish. Naming the command is the whole point -- the agent can run it by hand and
+    see for itself, which is the one thing a killed hook never let it do.
+    """
+    return (
+        f"{UNFINISHED_MARK}the {VERIFY_BUDGET_SECONDS}s budget for the whole verification "
+        "tier ran out while this check was running, so its result is unknown (an earlier "
+        "tier may have spent it).\nRe-run it by hand: " + " ".join(argv)
+    )
+
+
+def unfinished(failures: list[tuple[str, str | None, str]]) -> list[str]:
+    """The names of the checks the budget stopped, in order.
+
+    Recognised by the tail's prefix rather than by a fourth tuple field, so the shape
+    `run_checks` and `run_host_tests` both return -- and every test that builds one by
+    hand -- is unchanged.
+    """
+    return [name for name, _artifact, tail in failures if tail.startswith(UNFINISHED_MARK)]
+
+
+def _bounded_run(
+    argv: list[str], cwd: Path, deadline: float | None, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess | None:
+    """`subprocess.run` capped by the tier's shared deadline; None when it ran out.
+
+    A `None` is not the same as the `OSError` skip its callers also handle: a tool this
+    machine cannot run is a local gap and defers to CI, while a check that would not
+    finish is a fact about this branch worth reporting. Both stay non-fatal here --
+    `OSError` still propagates to the caller that skips it.
+    """
+    left = None if deadline is None else deadline - time.monotonic()
+    if left is not None and left <= 0:
+        return None
+    try:
+        return subprocess.run(
+            argv,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=left,
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return None
+
+
+def combined_output(result: subprocess.CompletedProcess) -> str:
+    """`stdout` and `stderr` as one string, tolerating either being `None`.
+
+    The codec above removes the only known way a capture returns `None` streams, and
+    this stays anyway, because the two failures are not the same size. An undecodable
+    byte in a lint tail is a cosmetic loss; a `TypeError` raised while *reporting* a
+    failure takes the whole Stop hook down, and a hook that dies writes no artifact,
+    prints nothing, and ends the session on "stop hook failed" -- the same worst-of-three
+    outcome `VERIFY_BUDGET_SECONDS` exists to prevent, arriving from the other end.
+
+    So: nothing on the reporting path may assume a stream was captured. `stdout=DEVNULL`
+    on a future call, or a test stubbing `subprocess.run`, produces `None` here too, and
+    neither should be able to end a session.
+    """
+    return (result.stdout or "") + (result.stderr or "")
 
 
 def _pytest_failures(
-    targets: list[str], repo_root: Path, extra_env: dict[str, str] | None = None
+    targets: list[str],
+    repo_root: Path,
+    extra_env: dict[str, str] | None = None,
+    deadline: float | None = None,
 ) -> list[tuple[str, str | None, str]]:
     """Run the host test tier over `targets`; [] on pass, one CHECK_TESTS failure else.
 
     Shared by both shapes of Tier 2b (with and without a DB), so the two differ only
     in the infra they arrange and the env they inject -- not in how a failure is
     captured and reported. An OS error is a skip: verification never blocks the agent
-    over a local tooling gap.
+    over a local tooling gap. Running out of `deadline` is not -- see `_bounded_run`.
     """
-    argv, artifact = test_runner_argv(targets)
+    argv, artifact = test_runner_argv(targets, repo_root)
     try:
-        result = subprocess.run(
+        result = _bounded_run(
             argv,
-            cwd=repo_root,
-            capture_output=True,
-            text=True,
+            repo_root,
+            deadline,
             env={**os.environ, **extra_env} if extra_env else None,
         )
     except OSError:
         return []
+    if result is None:
+        return [(CHECK_TESTS, artifact, timeout_tail(argv))]
     # 5 is pytest's EXIT_NOTESTSCOLLECTED, and it is not a failure here. Targets come
     # from `host_test_targets`, which selects *changed files* under tests/ -- so editing
     # a helper that holds no tests of its own (conftest.py, a support module) hands
@@ -576,12 +771,15 @@ def _pytest_failures(
     # with "no tests ran", which no source edit can resolve.
     if result.returncode in (0, PYTEST_NO_TESTS_COLLECTED):
         return []
-    tail = (result.stdout + result.stderr).strip().splitlines()[-20:]
+    tail = combined_output(result).strip().splitlines()[-20:]
     return [(CHECK_TESTS, artifact, "\n".join(tail))]
 
 
 def run_host_tests(
-    paths: list[str], env: Mapping[str, str], repo_root: Path = REPO_ROOT
+    paths: list[str],
+    env: Mapping[str, str],
+    repo_root: Path = REPO_ROOT,
+    deadline: float | None = None,
 ) -> list[tuple[str, str | None, str]]:
     """Tier 2b: host pytest for changed app/tests code, DB or no DB.
 
@@ -599,15 +797,18 @@ def run_host_tests(
     decided whether tests run.
     """
     if CFG.db.enabled:
-        return run_db_tests(paths, env, repo_root)
+        return run_db_tests(paths, env, repo_root, deadline)
     targets = host_test_targets(paths)
     if not targets:
         return []
-    return _pytest_failures(targets, repo_root)
+    return _pytest_failures(targets, repo_root, deadline=deadline)
 
 
 def run_db_tests(
-    paths: list[str], env: Mapping[str, str], repo_root: Path = REPO_ROOT
+    paths: list[str],
+    env: Mapping[str, str],
+    repo_root: Path = REPO_ROOT,
+    deadline: float | None = None,
 ) -> list[tuple[str, str | None, str]]:
     """Tier 2b with a DB: host pytest for changed app/tests against db+redis.
 
@@ -638,13 +839,15 @@ def run_db_tests(
         db_env = host_db_env(repo_root)
         if db_env is None:
             return []
-        return _pytest_failures(targets, repo_root, db_env)
+        return _pytest_failures(targets, repo_root, db_env, deadline)
     finally:
         _compose_stop(started, repo_root)
 
 
-def _command_for(name: str) -> tuple[list[str], Path, str | None] | None:
+def _command_for(name: str, root: Path | None = None) -> tuple[list[str], Path, str | None] | None:
     """(argv, cwd, artifact_path) for a check, or None when its tool is absent.
+
+    `root` is the tree to check -- `verify_root`'s answer, defaulting to this checkout.
 
     "Absent" includes a *script* that this project does not have. Returning an argv
     for a missing script does not skip the check -- the interpreter exits 2 with
@@ -657,8 +860,11 @@ def _command_for(name: str) -> tuple[list[str], Path, str | None] | None:
     is what lets CI hold a project to it: `scripts/hooks/tests/test_repo_contract.py`
     fails when a script this project's own config makes reachable is missing.
     """
+    base = REPO_ROOT if root is None else root
+    lint_all = _repo_script(base, LINT_ALL)
+    lock_markers = _repo_script(base, CHECK_LOCK_MARKERS)
     if name == CHECK_LINT:
-        if not LINT_ALL.exists():
+        if not lint_all.exists():
             return None
         # --no-secrets is part of the contract between this hook and lint-all.py: a
         # project whose lint runner has a detect-secrets pass skips it here (it is the
@@ -667,44 +873,64 @@ def _command_for(name: str) -> tuple[list[str], Path, str | None] | None:
         # way lint-all.py must *parse* it -- argparse rejecting it exits 2, which reads
         # as a permanent lint failure on every single Stop.
         return (
-            [verify_python(), str(LINT_ALL), "--changed", "--no-secrets"],
-            REPO_ROOT,
+            [verify_python(base), str(lint_all), "--changed", "--no-secrets"],
+            base,
             "logs/lint-errors.log",
         )
     if name == CHECK_SCRIPT_TESTS:
-        return ([verify_python(), "-m", "pytest", "scripts/hooks/tests/", "-q"], REPO_ROOT, None)
+        return ([verify_python(base), "-m", "pytest", "scripts/hooks/tests/", "-q"], base, None)
     if name == CHECK_LOCKS:
         # Optional tier: the script is project-owned (its sentinels name that
         # project's lockfiles), so a project without one simply has no tier.
-        if not CHECK_LOCK_MARKERS.exists():
+        if not lock_markers.exists():
             return None
-        return ([verify_python(), str(CHECK_LOCK_MARKERS)], REPO_ROOT, None)
+        return ([verify_python(base), str(lock_markers)], base, None)
     if name == CHECK_FRONTEND:
         npm = shutil.which("npm")
         if not npm:
             return None
-        return ([npm, *CFG.frontend.test_cmd], REPO_ROOT / CFG.frontend.dir, None)
+        # An unprovisioned tree is a missing toolchain, not a failing suite. A worktree
+        # checks out tracked files only, so a freshly cut box has no `node_modules` and
+        # `npm run test:run` exits non-zero with `'vitest' is not recognized` -- which
+        # `run_checks` reported as `failed: frontend / would fail CI`, twice, while the
+        # same suite was green in the checkout. That verdict points the session at its
+        # own diff, which is the one place the problem is not, and the fix it implies
+        # (change the code) is the wrong one. `shutil.which("npm")` was already this
+        # tier's "is the toolchain here" test; it was just asking about the wrong half.
+        if not (base / CFG.frontend.dir / "node_modules").is_dir():
+            return None
+        return ([npm, *CFG.frontend.test_cmd], base / CFG.frontend.dir, None)
     return None
 
 
-def run_checks(names: list[str]) -> list[tuple[str, str | None, str]]:
+def run_checks(
+    names: list[str], root: Path | None = None, deadline: float | None = None
+) -> list[tuple[str, str | None, str]]:
     """Run selected checks; return (name, artifact, tail) for each that failed.
 
     A missing tool or an OS error is a skip, never a failure: verification must
     never block the agent because of a local tooling gap.
+
+    `deadline` is the shared budget from `verify_deadline`; a check that outruns it is
+    reported rather than skipped, and the checks after it are stopped on arrival with
+    the same message. `None` leaves every check uncapped, which is what the unit tests
+    that stub `subprocess.run` want.
     """
     failures: list[tuple[str, str | None, str]] = []
     for name in names:
-        spec = _command_for(name)
+        spec = _command_for(name, root)
         if spec is None:
             continue
         argv, cwd, artifact = spec
         try:
-            result = subprocess.run(argv, cwd=cwd, capture_output=True, text=True)
+            result = _bounded_run(argv, cwd, deadline)
         except OSError:
             continue
+        if result is None:
+            failures.append((name, artifact, timeout_tail(argv)))
+            continue
         if result.returncode != 0:
-            tail = (result.stdout + result.stderr).strip().splitlines()[-15:]
+            tail = combined_output(result).strip().splitlines()[-15:]
             failures.append((name, artifact, "\n".join(tail)))
     return failures
 
@@ -741,7 +967,10 @@ def write_verify_artifact(
 
 
 def _print_verify_failures(
-    failures: list[tuple[str, str | None, str]], blocking: bool = True
+    failures: list[tuple[str, str | None, str]],
+    blocking: bool = True,
+    root: Path = REPO_ROOT,
+    foreign: bool = False,
 ) -> None:
     """Status line plus artifact paths -- never the failure text itself.
 
@@ -749,19 +978,38 @@ def _print_verify_failures(
     `.claude/rules/engineering.md`): streamed output scrolls away, and a 20-line tail
     inlined here is both too little to diagnose from and too much to skim.
     """
-    verdict = (
-        "Pre-stop verification found issues that would fail CI -- fix before finishing:"
-        if blocking
-        else (
+    stopped = unfinished(failures)
+    ran = [name for name, _artifact, _tail in failures if name not in stopped]
+    if blocking:
+        verdict = "Pre-stop verification found issues that would fail CI -- fix before finishing:"
+    elif foreign:
+        verdict = (
+            "Pre-stop verification failed, but this session wrote no files -- these belong "
+            "to whatever else is working in this tree. Not blocking, and not yours to fix:"
+        )
+    elif ran:
+        verdict = (
             f"Pre-stop verification still failing after {MAX_VERIFY_ROUNDS} attempts. "
             "Not blocking again -- but the branch is red and CI will say so:"
         )
-    )
+    else:
+        verdict = (
+            "Pre-stop verification did not finish, so it found nothing -- not blocking. "
+            "Run the command in the artifact if you have not already:"
+        )
     lines = [verdict]
-    tiers = ", ".join(name for name, _artifact, _tail in failures)
-    lines.append(f"  failed: {tiers}")
+    if ran:
+        lines.append(f"  failed: {', '.join(ran)}")
+    if stopped:
+        lines.append(
+            f"  unknown -- the {VERIFY_BUDGET_SECONDS}s budget stopped it: {', '.join(stopped)}"
+        )
+    # Artifact paths are relative to the tree that was checked, and that is not always
+    # this one -- say which, or the agent opens the checkout's stale copy of the file.
+    if root != REPO_ROOT:
+        lines.append(f"  checked: {root} (this session's box)")
     for path in dict.fromkeys(
-        [VERIFY_ARTIFACT] + [a for _n, a, _t in failures if a and (REPO_ROOT / a).exists()]
+        [VERIFY_ARTIFACT] + [a for _n, a, _t in failures if a and (root / a).exists()]
     ):
         lines.append(f"  details: {path}")
     lines.append(
@@ -781,39 +1029,76 @@ def verify(raw_stdin: str, env: Mapping[str, str]) -> int:
     """
     if not verify_enabled(env):
         return 0
-    paths = all_changed(_git_status_porcelain(REPO_ROOT), _git_branch_diff(REPO_ROOT))
+    # Not REPO_ROOT: the session's edits may all be in a box, and verifying the checkout
+    # instead means blocking this session on another branch's failures. See `verify_root`.
+    root = verify_root(raw_stdin, REPO_ROOT)
+    paths = all_changed(_git_status_porcelain(root), _git_branch_diff(root))
     # Infra-light tiers (lint, script-tests, locks, frontend) plus the application
     # test tier, which arranges its own db+redis reachability/autostart/teardown when
     # this project has a DB and just runs pytest when it does not.
-    failures = run_checks(select_checks(paths))
-    failures += run_host_tests(paths, env)
-    write_verify_artifact(failures)
+    deadline = verify_deadline()
+    failures = run_checks(select_checks(paths), root, deadline)
+    failures += run_host_tests(paths, env, root, deadline)
+    write_verify_artifact(failures, root)
     if not failures:
-        write_rounds(0)  # green: the next failure starts from a full budget.
+        write_rounds(0, root)  # green: the next failure starts from a full budget.
         return 0
 
-    rounds_used = blocked_rounds(read_rounds(), stop_hook_active(raw_stdin))
-    if not should_block(rounds_used):
-        write_rounds(0)
-        _print_verify_failures(failures, blocking=False)
+    # A round with nothing but stopped checks is not a red branch -- it is a gate that ran
+    # out of time, and blocking on it buys nothing: the retry gets the same budget, spends
+    # it in the same place, and asks again. That happened twice in a row on devkit#237,
+    # each time at the tail of a long session where a turn is at its most expensive, with
+    # the suite already run green by hand in between. So report it, keep the artifact
+    # naming the command, and leave the answer to that run or to CI. A round that also
+    # holds a check which *did* finish and fail still blocks on that check.
+    if unfinished(failures) == [name for name, _artifact, _tail in failures]:
+        write_rounds(0, root)
+        _print_verify_failures(failures, blocking=False, root=root)
         return 0
-    write_rounds(rounds_used)
-    _print_verify_failures(failures, blocking=True)
+
+    # A session that wrote no files did not cause these, and cannot be the one to fix
+    # them: the checkout is shared, and something else is working in it. Reported so the
+    # red tree is still visible, never blocked on. See `stop_session`.
+    if stop_session.session_wrote_nothing(raw_stdin):
+        write_rounds(0, root)
+        _print_verify_failures(failures, blocking=False, foreign=True, root=root)
+        return 0
+
+    rounds_used = blocked_rounds(read_rounds(root), stop_hook_active(raw_stdin))
+    if not should_block(rounds_used):
+        write_rounds(0, root)
+        _print_verify_failures(failures, blocking=False, root=root)
+        return 0
+    write_rounds(rounds_used, root)
+    _print_verify_failures(failures, blocking=True, root=root)
     return 2
 
 
 def main() -> int:
+    # Before stdin, before git, before the frontend typecheck: an operator who has
+    # switched this gate off is not waiting on any of it. See `harness_config.hooks_off`.
+    if harness_config.hooks_off("stop"):
+        return 0
+
     raw_stdin = _read_stdin()
 
-    if CFG.frontend.enabled and skin_changed(_git_skin_status(REPO_ROOT)):
+    root = verify_root(raw_stdin, REPO_ROOT)
+    if CFG.frontend.enabled and skin_changed(_git_skin_status(root)):
         npm = shutil.which("npm")
         if npm:
-            subprocess.run(
-                [npm, *CFG.frontend.typecheck_cmd],
-                cwd=REPO_ROOT / CFG.frontend.dir,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+            # Capped like the verification tiers, and for the same reason: this runs
+            # before them, inside the same hook, and its output is discarded -- so a
+            # typecheck that hangs spends the harness's whole ceiling on a side effect
+            # nobody reads. Its own budget rather than a share of the gate's, because
+            # the gate is the part whose result matters.
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                subprocess.run(
+                    [npm, *CFG.frontend.typecheck_cmd],
+                    cwd=root / CFG.frontend.dir,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=TYPECHECK_TIMEOUT_SECONDS,
+                )
 
     # Pre-stop verification runs last: it may exit 2 to block the stop and relay
     # failures back into the session. All best-effort side effects above have

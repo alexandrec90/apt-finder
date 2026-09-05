@@ -10,7 +10,53 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[3]
+
+
+@pytest.fixture(autouse=True)
+def _ledger_off_the_machine(tmp_path_factory, monkeypatch):
+    """Point `$DEVKIT_DIR` at a scratch directory for every test in this tree.
+
+    `harness_events.record` resolves its destination from `$DEVKIT_DIR`, so any hook a
+    test drives end to end appends to **this machine's real** harness-events ledger --
+    the one `harness_triage.py` reads as a backlog of things an agent hit. Every test
+    that knew it wrote there already monkeypatched the variable itself; the defect is
+    that knowing was required. One that did not, `test_codex_translation.py`'s
+    end-to-end refusal case, filed 18 `codex-translation-gap` items against a project
+    called `test_a_lost_decision_is_refuse0` -- a pytest `tmp_path` basename -- and they
+    sat on the open list as a recurring harness failure nobody could reproduce, because
+    the only thing reproducing them was the suite.
+
+    Autouse rather than a fixture to remember, for the reason the ledger exists at all:
+    a diagnostic that a test can quietly poison is a diagnostic nobody can trust. Tests
+    that set or delete the variable themselves still win -- `monkeypatch` applies in
+    order and theirs runs second -- so nothing that asserts on the unset behaviour
+    changes, and `record(root=...)`, which names its destination outright, never
+    consulted the environment in the first place.
+    """
+    monkeypatch.setenv("DEVKIT_DIR", str(tmp_path_factory.mktemp("ledger")))
+
+
+@pytest.fixture(autouse=True)
+def _harness_switch_off_the_machine(monkeypatch):
+    """Clear `$DEVKIT_HOOKS_OFF` for every test in this tree.
+
+    The variable is the harness kill switch (`harness_config.hooks_off`), and it is set
+    in a `settings.json` `env` block -- so it is present in the environment of every
+    agent session on a machine where someone has switched the harness off, and absent in
+    CI. A suite that inherits it is a suite whose hooks stand down: every test that
+    drives `stop.py`, `lint-fix.py`, `enforce-capped-bash.py` or `session-start.sh` end
+    to end would be asserting against a hook that returned before doing anything, and
+    would pass by agreeing that nothing happened. Same shape as the ledger fixture above
+    -- a test a machine's own configuration can quietly hollow out is worse than none.
+
+    Tests that set it themselves still win: `monkeypatch` applies in order and theirs
+    runs second.
+    """
+    monkeypatch.delenv("DEVKIT_HOOKS_OFF", raising=False)
+
 
 # Put scripts/ on the path so modules under it (e.g. `diagnostics`) import the
 # same way they do at runtime, where the script's own dir is sys.path[0].
